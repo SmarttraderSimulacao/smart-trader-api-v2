@@ -5,7 +5,7 @@ const cors = require('cors');
 const EventEmitter = require('events');
 const connectDB = require('./config/db');
 const apiRoutes = require('./routes/apiRoutes');
-//const competitionCandleGenerator = require('./services/competitionCandleGenerator');
+const competitionCandleGenerator = require('./services/competitionCandleGenerator');
 const { authenticateSocket } = require('./middleware/auth');
 require('dotenv').config();
 
