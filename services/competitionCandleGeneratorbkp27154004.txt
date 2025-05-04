@@ -1,0 +1,256 @@
+const CandleGenerator = require('./candleGenerator');
+const Room = require('../models/Room');
+const tradeController = require('../controllers/tradeController');
+
+class CompetitionCandleGenerator extends CandleGenerator {
+  constructor() {
+    super();
+    this.marketOpen = false;
+    this.competitionDate = null;
+    this.activeRooms = new Set();
+    this.INITIAL_PRICE = 10000; // Preço inicial padrão
+  }  
+  // Verificar horários e ativar/desativar salas
+  async checkCompetitionTimes() {
+    try {
+      const now = new Date();
+      const currentHour = now.getHours();
+      const currentMinute = now.getMinutes();
+      
+      // Formatar a data atual (sem horas)
+      const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+      
+      // Para cada sala, verificar se deve iniciar ou encerrar
+      const rooms = await Room.find({
+        competitionDate: { 
+          $gte: new Date(today.getTime() - 24 * 60 * 60 * 1000), // Ontem
+          $lte: new Date(today.getTime() + 24 * 60 * 60 * 1000)  // Amanhã
+        }
+      });
+      
+      for (const room of rooms) {
+        const [startHour, startMinute] = room.startTime.split(':').map(Number);
+        const [endHour, endMinute] = room.endTime.split(':').map(Number);
+        
+        // Verificar se é hora de iniciar a competição
+        const shouldStart = currentHour === startHour && currentMinute === startMinute;
+        
+        // Verificar se é hora de encerrar a competição
+        const shouldEnd = currentHour === endHour && currentMinute === endMinute;
+        
+        // Verificar se a data da competição é hoje
+        const roomDate = new Date(room.competitionDate);
+        const isToday = roomDate.getDate() === today.getDate() && 
+                       roomDate.getMonth() === today.getMonth() && 
+                       roomDate.getFullYear() === today.getFullYear();
+        
+        if (isToday && shouldStart && room.status === 'PENDING') {
+          console.log(`Iniciando competição na sala ${room.name}`);
+          await this.startCompetition(room._id);
+        }
+        
+        if (isToday && shouldEnd && room.status === 'ACTIVE') {
+          console.log(`Encerrando competição na sala ${room.name}`);
+          await this.endCompetition(room._id);
+        }
+      }
+      
+      // Atualizar status global do mercado
+      this.updateMarketStatus();
+      
+      return { activeRooms: Array.from(this.activeRooms) };
+    } catch (error) {
+      console.error('Erro ao verificar horários de competição:', error);
+      return { error: error.message };
+    }
+  }
+  
+  // Iniciar competição em uma sala
+  async startCompetition(roomId) {
+    try {
+      const room = await Room.findById(roomId);
+      
+      if (!room) {
+        throw new Error(`Sala ${roomId} não encontrada`);
+      }
+      
+      if (room.status !== 'PENDING') {
+        throw new Error(`Sala ${roomId} não está pendente (status: ${room.status})`);
+      }
+      
+      // Atualizar status da sala
+      room.status = 'ACTIVE';
+      
+      // Reiniciar capital de todos os participantes
+      room.participants.forEach(participant => {
+        participant.currentCapital = participant.initialCapital;
+        participant.openPositions = []; // Limpar posições
+      });
+      
+      await room.save();
+      
+      // Adicionar à lista de salas ativas
+      this.activeRooms.add(roomId);
+      
+      // Se é a primeira sala ativa, reiniciar o gerador de candles com preço inicial
+      if (this.activeRooms.size === 1) {
+        this.resetGenerator();
+      }
+      
+      // Notificar sobre o início da competição (para ser usado com WebSockets)
+      return { 
+        success: true, 
+        message: `Competição iniciada na sala ${room.name}`,
+        room 
+      };
+    } catch (error) {
+      console.error(`Erro ao iniciar competição na sala ${roomId}:`, error);
+      return { success: false, error: error.message };
+    }
+  }
+  
+  // Reiniciar o gerador de candles com preço inicial
+  resetGenerator() {
+    console.log(`Reiniciando gerador de candles com preço inicial ${this.INITIAL_PRICE}`);
+    this.initialize(this.INITIAL_PRICE);
+    this.marketOpen = true;
+    this.competitionDate = new Date();
+  }
+  
+  // Encerrar competição em uma sala
+  async endCompetition(roomId) {
+    try {
+      const room = await Room.findById(roomId);
+      
+      if (!room) {
+        throw new Error(`Sala ${roomId} não encontrada`);
+      }
+      
+      if (room.status !== 'ACTIVE') {
+        throw new Error(`Sala ${roomId} não está ativa (status: ${room.status})`);
+      }
+      
+      // Encerrar todas as posições abertas pelo preço atual
+      const currentPrice = this.lastPrice;
+      
+      for (const participant of room.participants) {
+        // Fechar todas as posições abertas com o preço atual
+        if (participant.openPositions.length > 0) {
+          for (const position of participant.openPositions) {
+            // Calcular lucro/prejuízo
+            let pnl = 0;
+            if (position.type === 'LONG') {
+              pnl = (currentPrice - position.entryPrice) * position.size;
+            } else {
+              pnl = (position.entryPrice - currentPrice) * position.size;
+            }
+            
+            // Atualizar capital do participante
+            participant.currentCapital += pnl;
+          }
+          
+          // Limpar posições
+          participant.openPositions = [];
+        }
+      }
+      
+      // Calcular vencedores
+      const ranking = room.getCurrentRanking();
+      
+      const winners = [];
+      
+      // Calcular prêmios para os 7 primeiros
+      for (let i = 0; i < Math.min(7, ranking.length); i++) {
+        const position = i + 1;
+        const distribution = room.prizeDistribution.find(d => d.position === position);
+        const percentage = distribution ? distribution.percentage : 0;
+        const prize = Math.floor(room.totalPrizePool * (percentage / 100));
+        
+        winners.push({
+          position,
+          userId: ranking[i].userId,
+          username: ranking[i].username,
+          finalCapital: ranking[i].capital,
+          prize,
+          paid: false
+        });
+      }
+      
+      room.winners = winners;
+      room.status = 'CLOSED';
+      await room.save();
+      
+      // Remover da lista de salas ativas
+      this.activeRooms.delete(roomId);
+      
+      // Se não há mais salas ativas, parar o gerador de candles
+      if (this.activeRooms.size === 0) {
+        this.marketOpen = false;
+        console.log('Todas as competições encerradas. Mercado fechado.');
+      }
+      
+      return { 
+        success: true, 
+        message: `Competição encerrada na sala ${room.name}`,
+        room, 
+        winners 
+      };
+    } catch (error) {
+      console.error(`Erro ao encerrar competição na sala ${roomId}:`, error);
+      return { success: false, error: error.message };
+    }
+  }
+  
+  // Atualizar status do mercado com base nas salas ativas
+  updateMarketStatus() {
+    const previousStatus = this.marketOpen;
+    this.marketOpen = this.activeRooms.size > 0;
+    
+    // Se o mercado acabou de abrir
+    if (!previousStatus && this.marketOpen) {
+      console.log('Mercado aberto');
+      this.resetGenerator(); // Reiniciar com preço padrão
+    }
+    
+    // Se o mercado acabou de fechar
+    if (previousStatus && !this.marketOpen) {
+      console.log('Mercado fechado');
+    }
+  }
+  
+  // Sobrescrever getNextTick para verificar Stop Loss e Take Profit
+  getNextTick() {
+    // Se o mercado estiver fechado, retornar o último preço
+    if (!this.marketOpen) {
+      return this.lastPrice;
+    }
+    
+    // Obter próximo preço normalmente
+    const newPrice = super.getNextTick();
+    
+    // Verificar Stop Loss e Take Profit (async, não esperamos pelo resultado)
+    tradeController.checkStopLossAndTakeProfit(newPrice).catch(err => {
+      console.error('Erro ao verificar SL/TP:', err);
+    });
+    
+    return newPrice;
+  }
+  
+  // Sobrescrever finalizeCurrentCandle para lidar com o horário de mercado
+  finalizeCurrentCandle(timeframe = 1) {
+    // Se o mercado estiver fechado, não fazer nada
+    if (!this.marketOpen) {
+      // Apenas criar um novo candle com o último preço
+      this.startNewCandle(timeframe);
+      return {
+        ...this.currentFormingCandle,
+        timestamp: Date.now()
+      };
+    }
+    
+    return super.finalizeCurrentCandle(timeframe);
+  }
+}
+
+// Altere esta linha para exportar uma instância (mantendo compatibilidade)
+module.exports = new CompetitionCandleGenerator();
