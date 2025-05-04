@@ -1,6 +1,6 @@
 const Trade = require('../models/Trade');
 const Room = require('../models/Room');
-const User = require('../models/User');
+const User = require('../models/user');
 const candleGenerator = require('../services/competitionCandleGenerator');
 
 // @desc    Criar uma nova operação
