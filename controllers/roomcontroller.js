@@ -1,5 +1,5 @@
 const Room = require('../models/Room');
-const User = require('../models/User');
+const User = require('../models/user');
 const Trade = require('../models/Trade');
 
 // @desc    Obter todas as salas disponíveis
