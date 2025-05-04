@@ -1,7 +1,7 @@
 const Trade = require('../models/Trade');
 const Room = require('../models/Room');
 const User = require('../models/user');
-const candleGenerator = require('../services/competitionCandleGenerator');
+//const candleGenerator = require('../services/competitionCandleGenerator');
 
 // @desc    Criar uma nova operação
 // @route   POST /api/trades
